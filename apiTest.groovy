@@ -10,6 +10,8 @@ class Globals {
 	static boolean SECURE
 	static String HTTP_HEAD
 	static RestApi API
+	static HTTPBuilder HTTP
+	static RESTClient RESTAPI
 
 	static void Init() {
 		TASK_NUM = 1
@@ -18,6 +20,9 @@ class Globals {
 		SECURE = false
 		HTTP_HEAD = 'http'
 		API = new RestApi()
+		HTTP = new HTTPBuilder(GetHostName() + '/activiti-rest/service/')
+		RESTAPI = new RESTClient(GetHostName() + '/activiti-rest/service/')
+		RESTAPI.auth.basic(CONF.username, CONF.password)
 	}
 
 	static void SetHttps(httpSecure) {
@@ -48,23 +53,69 @@ class Globals {
 	}
 }
 
-enum LogLevel {
-	None,
-	Short,
-	Verbose
+enum MapType {
+	Create,
+	Delete,
+	Update
 }
 
 abstract class Service {
+	def area 
+	def serviceId
 	def created
 	def name
+	def historic = false
 
-	Service(name) {
-		created = []
+	Service(name, area, serviceId) {
+		this.created = []
 		this.name = name
+		this.area = area
+		this.serviceId = serviceId
 	}
 
-	abstract void create(item)
-	abstract void delete(item)
+	def getPrefix() {
+		historic ? "history/historic-$serviceId" : "$area/$serviceId"
+	}
+
+	def list(query = [:]) {
+		def resp = Globals.RESTAPI.get(path: getPrefix(), query: query, requestContentType: JSON)
+	    return resp.data.data
+	}
+
+	def get(id) {
+		def resp = Globals.RESTAPI.get(path: "${getPrefix()}/$id", requestContentType: JSON)
+		return resp.data
+	}
+
+	def create(item) {
+	    def resp = Globals.RESTAPI.post(path: getPrefix(), body: item.toMap(MapType.Create), requestContentType: JSON)
+		updateItem(item, resp.data)
+	    created.add(item)
+	    return resp.data
+	}
+
+	def update(item) {
+		def resp = Globals.RESTAPI.put(path: "${getPrefix()}/${item.id}", body: item.toMap(MapType.Update), requestContentType: JSON)
+		updateItem(item, resp.data)
+	    return resp.data
+	}
+
+	def updateItem(item, jsonData) {
+		def itemToUpdate = historic ? item.history : item
+		itemToUpdate.class.declaredFields.findAll { !it.synthetic && jsonData.containsKey("$it.name") }.each {
+			item."$it.name" = jsonData."$it.name"
+		}
+		itemToUpdate.id = jsonData.id
+	}
+
+	def refresh(item) {
+		updateItem(item, get(item.id))
+	}
+
+	def delete(item) {
+		def resp = Globals.RESTAPI.delete(path: "${getPrefix()}/$item.id", requestContentType: JSON)
+		resp.status == 204
+	}
 
 	void cleanUp() {
 		println "${name}: cleaning up..."
@@ -73,32 +124,8 @@ abstract class Service {
 }
 
 class ProcessDefinitionService extends Service {
-	ProcessDefinitionService(name) {
-		super(name)
-	}
-
-	def list(query = [:]) {
-		def definitions = []
-		def http = new HTTPBuilder(Globals.GetHostName())
-		http.auth.basic(Globals.CONF.username, Globals.CONF.password)
-	    http.request(GET, JSON) {
-	        uri.path = '/activiti-rest/service/repository/process-definitions'
-	        uri.query = query
-	
-	  		headers.'User-Agent' = 'Mozilla/5.0 Ubuntu/8.10 Firefox/3.0.4'
-	        response.success = { resp, json ->
-	        	//if(Globals.logLevel != LogLevel.None)
-	        		println "Process definitions (${json.data.size()}):"
-	        	json.data.each {
-	        		Globals.PrintDefinition(it) 
-	        		definitions.add(new ProcessDefinition(it))
-	        	}
-	        }
-	        response.failure = { resp ->
-	        	println "[${resp.status} Failure!]"
-	        }
-	    }
-	    return definitions
+	ProcessDefinitionService(name, area, serviceId) {
+		super(name, area, serviceId)
 	}
 
 	def getVariables(definition) {
@@ -114,30 +141,12 @@ class ProcessDefinitionService extends Service {
 	/**
 	 * bpmn = business process model and notation
 	 */
-	void getBpm(item, query = [:]) {
-		def definitions = []
-		def http = new HTTPBuilder(Globals.GetHostName())
-		http.auth.basic(Globals.CONF.username, Globals.CONF.password)
-	    http.request(GET, JSON) {
-	        uri.path = "/activiti-rest/service/repository/process-definitions/${item.id}/model"
-	        uri.query = query
-	
-	  		headers.'User-Agent' = 'Mozilla/5.0 Ubuntu/8.10 Firefox/3.0.4'
-	        response.success = { resp, json ->
-	        	//println "${item.id} BPM:"
-	        	//println json.each { println it }
-	        }
-	        response.failure = { resp ->
-	        	println "[${resp.status}] Failure!"
-	        }
-	    }
+	def getBpmn(item) {
+		def resp = Globals.RESTAPI.get(path: "${getPrefix()}/$item.id/model", requestContentType: JSON)
+		return resp.data
 	}
 
-	void create(item) {
-
-	}
-
-	void delete(item) {
+	def delete(item) {
 
 	}
 }
@@ -147,8 +156,8 @@ class ProcessDefinition {
 	def url
 	def key
 	def version
-	String name
-	String description
+	def name
+	def description
 	def deploymentId
 	def deploymentUrl
 	def resource
@@ -159,7 +168,7 @@ class ProcessDefinition {
 	def startFormDefined
 
 	ProcessInstance toProcessInstance() {
-		return [definition: this] as ProcessInstance
+		[ definition: this ] as ProcessInstance
 	}
 
 	def toMap() {
@@ -169,42 +178,96 @@ class ProcessDefinition {
 	}
 }
 
+class HistoricProcessInstance {
+	def id
+    def businessKey
+    def processDefinitionId
+    def processDefinitionUrl
+    def startTime
+    def endTime
+    def durationInMillis
+    def startUserId
+    def startActivityId
+    def endActivityId
+    def deleteReason
+    def superProcessInstanceId
+    def url
+    def variables
+    def tenantId
+}
+
 class ProcessInstance {
 	def id
-	String businessKey
 	def variables
+	def url
+	def businessKey
+	def suspended
+	def ended
+	def processDefinitionId
+	def processDefinitionUrl
+	def activityId
+	def tenantId
+	def completed
 	ProcessDefinition definition
+	HistoricProcessInstance history = new HistoricProcessInstance()
+
+	def toMap() {
+		this.class.declaredFields.findAll { !it.synthetic }.collectEntries {
+      		[ (it.name):this."$it.name" ]
+    	}
+	}
+
+	def toMap(mapType) {
+		def asMap
+		switch(mapType) {
+		case MapType.Create:
+		case MapType.Update:
+		    asMap = [
+		    	processDefinitionId: processDefinitionId,
+		    	businessKey: businessKey,
+		    	variables: variables
+	    	]	
+			break
+		default:
+			asMap = this.toMap()
+		}
+		return asMap
+	}
 }
 
 class ProcessInstanceService extends Service {
-	ProcessInstanceService(name) {
-		super(name)
+	ProcessInstanceService(name, area, serviceId) {
+		super(name, area, serviceId)
 	}
 
 	void printOut(processInstance) {
 		println "[${processInstance.id}] ${processInstance.definition.name}"
 	}
 
-	void list(query = [:]) {
-		def http = new HTTPBuilder(Globals.GetHostName())
-		http.auth.basic(Globals.CONF.username, Globals.CONF.password)
-	    http.request(GET, JSON) {
-	        uri.path = '/activiti-rest/service/runtime/process-instances'
-	        uri.query = query
-	
-	  		headers.'User-Agent' = 'Mozilla/5.0 Ubuntu/8.10 Firefox/3.0.4'
-	        response.success = { resp, json ->
-	        	println "Process Instances (${json.data.size()}):"
-	        	json.data.each { println "[${it.id}] ${it.activityId}" }
-	        }
-	        response.failure = { resp ->
-	        	println "[${resp.status}] Failure!"
-	        }
-	    }
+	def createFromList(definitions) {
+		definitions.each {
+			def instance = it.toProcessInstance()
+			instance.variables = getStartVariables(it)
+			create(instance)
+		}
 	}
 
-	void createFromList(definitions) {
-		definitions.each { create(it.toProcessInstance()) }
+	def getStartVariables(definition) {
+		def variables = []
+		def startVars = Globals.API.form.get([processDefinitionId: definition.id]).formProperties
+		if(startVars.size() > 0) println "Please enter set start variables for $definition.id:"
+		startVars.each {
+			def line
+			if(it.type == "enum") {
+				def enumIds = it.enumValues.id.join(", ")
+				line = System.console().readLine("> [$it.type] [$enumIds] $it.name: ")
+			}
+			else {
+				line = System.console().readLine("> [$it.type] $it.name: ")
+			}
+			variables.add([name: it.id, value: line])
+		}
+		return variables
 	}
 
 	/**
@@ -212,7 +275,7 @@ class ProcessInstanceService extends Service {
 	 * definition must be set, otherwise the instance will not be created
 	 * and the http request will return an error message.
 	 */
-	void create(item) {
+	def create(item) {
 		def http = new HTTPBuilder(Globals.GetHostName())
 		http.auth.basic(Globals.CONF.username, Globals.CONF.password)
 	    http.request(POST, JSON) {
@@ -236,12 +299,12 @@ class ProcessInstanceService extends Service {
 	        }
 
 	        response.failure = { resp, reader ->
-	        	println "[${resp.status}] Http failure: ${reader.errorMessage}"
+	        	println "[${resp.status}] http [$item.definition.id]: ${reader.errorMessage}"
 	        }
 	    }
 	}
 
-	void delete(item) {
+	def delete(item) {
 		def http = new HTTPBuilder(Globals.GetHostName())
 		http.auth.basic(Globals.CONF.username, Globals.CONF.password)
 	    http.request(DELETE, JSON) {
@@ -250,15 +313,12 @@ class ProcessInstanceService extends Service {
 	
 	  		headers.'User-Agent' = 'Mozilla/5.0 Ubuntu/8.10 Firefox/3.0.4'
 	        response.success = { resp, json ->
-	        	if (resp.status == 204) {
-	        		println "Process instance successfully deleted"
-	        	}
-	        	else {
+	        	if (resp.status != 204) {
 	        		println "[${resp.status}] Process instance could not be deleted."
 	        	}
 	        }
 	        response.failure = { resp, reader ->
-	        	println "[${resp.status}] failure: ${reader.errorMessage}"
+
 	        }
 	    }
 	}
@@ -292,84 +352,59 @@ class Task {
 	def processDefinitionUrl
 	def variables
 
+	def update(jsonData) {
+		this.class.declaredFields.findAll { !it.synthetic }.each {
+			it = jsonData[it.name]
+		}
+	}
+
 	def toMap() {
 		this.class.declaredFields.findAll { !it.synthetic }.collectEntries {
       		[ (it.name):this."$it.name" ]
     	}
 	}
 
-	def toCreateMap() {
-		return [
-	        "assignee": assignee,
-	  		"delegationState": delegationState,
-	  		"description": description,
-	  		"dueDate": dueDate,
-	  		"name": name,
-	  		"owner": owner,
-	  		"priority": priority
-	    ]
+	def toMap(mapType) {
+		def asMap
+		switch(mapType) {
+		case MapType.Create:
+		case MapType.Update:
+		    asMap = [
+	        	assignee: assignee,
+	  			delegationState: delegationState,
+	  			description: description,
+	  			dueDate: dueDate,
+	  			name: name,
+	  			owner: owner,
+	  			parentTaskId: parentTaskId,
+	  			priority: priority
+	    	]	
+			break
+		default:
+			asMap = this.toMap()
+		}
+		return asMap
 	}
 }
 
 class TaskService extends Service {
-	TaskService(name) {
-		super(name)
+	TaskService(name, area, serviceId) {
+		super(name, area, serviceId)
 	}
 
-	// Gets a list of all tasks
-	void list(query = [:]) {
-		println query
-		def http = new HTTPBuilder(Globals.GetHostName())
-		http.auth.basic(Globals.CONF.username, Globals.CONF.password)
-	    http.request(POST, JSON) {
-	        uri.path = '/activiti-rest/service/query/tasks'
-	        body = query
-	  		headers.'User-Agent' = 'Mozilla/5.0 Ubuntu/8.10 Firefox/3.0.4'
-	        response.success = { resp, json ->
-	        	println "Tasks (${json.data.size()}):"
-	        	def tasks = []
-	        	json.data.each { 
-	        		Globals.PrintTask(it) 
-	        		tasks.add(new Task(it))
-	        	}
-	        	return tasks
-	        }
-	        response.failure = { resp, reader ->
-	        	println "[${resp.status}] failure: ${reader.errorMessage}"
-	        }
-	    }
-	}
-	
-	void create(name, description, dueDate) {
+	def create(name, description, dueDate) {
 		create([name:name.toString(), description:description.toString(), dueDate:dueDate.format("yyyy-MM-dd'T'HH:mm:ss.SSSZ")] as Task)
 	}
 
-	// item is a Task
-	void create(item) {
-		def http = new HTTPBuilder(Globals.GetHostName())
-		http.auth.basic(Globals.CONF.username, Globals.CONF.password)
-	    http.request(POST, JSON) {
-	        uri.path = '/activiti-rest/service/runtime/tasks' 
-	        body = item.toCreateMap()
-	
-	  		headers.'User-Agent' = 'Mozilla/5.0 Ubuntu/8.10 Firefox/3.0.4'
-	        response.success = { resp, json ->
-	        	if (resp.status == 201) {
-	        		println "Created task: [${json.id}] ${json.name}"
-	        	}
-	        	else {
-	        		println "[${resp.status}] Task was not created."
-	        	}
-	        	created.add(new Task(id:json.id))
-	        }
-	        response.failure = { resp ->
-	        	println "[${resp.status}] Http failure!"
-	        }
-	    }
+	def list(query = [:]) {
+		def resp = Globals.RESTAPI.post(path: "query/${serviceId}", body: query, requestContentType: JSON)
+	    return resp.data.data
 	}
 
+
 	// Item is a Task
-	void delete(item) {
+	// Tried to use Service's delete method, but got an authentication error.
+	def delete(item) {
 		def http = new HTTPBuilder(Globals.GetHostName())
 		http.auth.basic(Globals.CONF.username, Globals.CONF.password)
 	    http.request(DELETE, JSON) {
@@ -381,48 +416,91 @@ class TaskService extends Service {
 	
 	  		headers.'User-Agent' = 'Mozilla/5.0 Ubuntu/8.10 Firefox/3.0.4'
 	        response.success = { resp, json ->
-	        	if (resp.status == 204) {
-	        		println "Task ${item.id} successfully deleted"
-	        	}
-	        	else {
-	        		println "[${resp.status}] Task could not be deleted."
-	        	}
+	        	return resp
 	        }
 	        response.failure = { resp, reader ->
-	        	println "[${resp.status}] failure: ${reader.errorMessage}"
+	        	//println "[${resp.status}] failure: ${reader.errorMessage}"
+	        	return resp.status
 	        }
 	    }
 	}
 
-	void update(item, query) {
-		println "--------------------------------------"
-		println "Updating task: ${item.id}..."
-		def http = new HTTPBuilder(Globals.GetHostName())
-		http.auth.basic(Globals.CONF.username, Globals.CONF.password)
-	    http.request(PUT, JSON) {
-	        uri.path = "/activiti-rest/service/runtime/tasks/${item.id}"
-	        body = query
-	
-	  		headers.'User-Agent' = 'Mozilla/5.0 Ubuntu/8.10 Firefox/3.0.4'
-	        response.success = { resp, json ->
-	        	println "Task successfully updated"
-	        }
-	        response.failure = { resp, reader ->
-	        	println "[${resp.status}] failure: ${reader.errorMessage}"
-	        }
-	    }
+	def takeAction(item, query) {
+		def resp = Globals.RESTAPI.post(path: "${getPrefix()}/${item.id}", body: query, requestContentType: JSON)
+		return resp.data
+	}
+}
+
+class FormService extends Service {
+	FormService(name, area, serviceId) {
+		super(name, area, serviceId)
+	}
+
+	def get(query) {
+		def resp = Globals.RESTAPI.get(path: getPrefix(), query: query, requestContentType: JSON)
+		return resp.data
+	}
+
+	def delete(item) {
+
+	}
+}
+
+class User {
+	def id
+	def firstName
+	def lastName
+	def url
+	def email
+
+	def toMap() {
+		this.class.declaredFields.findAll { !it.synthetic }.collectEntries {
+      		[ (it.name):this."$it.name" ]
+    	}
+	}
+
+	def toMap(mapType) {
+		def asMap
+		switch(mapType) {
+		case MapType.Create:
+		case MapType.Update:
+		    asMap = [
+		    	firstName: firstName,
+		    	lastName: lastName,
+		    	url: url,
+		    	email: email
+	    	]	
+			break
+		default:
+			asMap = this.toMap()
+		}
+		return asMap
+	}
+}
+
+class UserService extends Service {
+	UserService(name, area, serviceId) {
+		super(name, area, serviceId)
+	}
+
+	def delete(item) {
+
 	}
 }
 
 class RestApi {
 	TaskService task
+	FormService form
+	UserService user
 	def process
 
 	RestApi() {
-		task = new TaskService("TaskService")
+		task = new TaskService("TaskService", "runtime", "tasks")
+		form = new FormService("FormService", "form", "form-data")
+		user = new UserService("UserService", "identity", "users")
 		process = [
-			instance: new ProcessInstanceService("ProcessInstanceService"),
-			definition: new ProcessDefinitionService("ProcessDefinitionService")
+			instance: new ProcessInstanceService("ProcessInstanceService", "runtime", "process-instances"),
+			definition: new ProcessDefinitionService("ProcessDefinitionService", "repository", "process-definitions")
 		]
 	}
 	
@@ -458,19 +536,79 @@ class RestApi {
 def main() {
 	Globals.Init()
     RestApi api = Globals.API
-    api.task.list()
+
+    // Set the email of the person who will request vacation time to the test email.
+    // Given the email task works, they should get an email if the request is approved.
+    User kermit = api.user.get(Globals.CONF.username)
+    kermit.email = Globals.CONF.testEmail
+    api.user.update(kermit)
+
+    // Create a few tasks, update assignee by updating the task (not by claiming)
     api.task.create("Test Task ${Globals.GetTaskNum()}", 'Test task description.', new Date().plus(7))
     api.task.create("Test Task ${Globals.GetTaskNum()}", 'Test task description.', new Date().plus(14))
     api.task.create("Test Task ${Globals.GetTaskNum()}", 'Test task description.', new Date().plus(21))
-    api.task.update([id:api.task.created[0].id], ["assignee":Globals.CONF.username2.toString()])
-    api.task.list(["assignee":Globals.CONF.username.toString()])
-    api.task.list(["assignee":Globals.CONF.username2.toString()])
-    def definitions = api.process.definition.list()
+    def taskUp = api.task.created[0]
+    taskUp.assignee = Globals.CONF.username2
+    api.task.update(taskUp)
+
+    // Get all deployed process definitions
+    def definitions = api.process.definition.list().collect { new ProcessDefinition(it) }
+    // Create a process instance for each definition
     api.process.instance.createFromList(definitions)
-    api.process.instance.list()
+
+    // Get the handle vacation request task
+    def handleVacReq = api.task.list([name:"Handle vacation request"])[0]
+    // In case there are two or more vacation request tasks, get the correct process instance
+    def vacationReq = new ProcessInstance(api.process.instance.get(handleVacReq.processInstanceId))
+    api.task.takeAction(handleVacReq, [action:"claim", assignee:Globals.CONF.username])
+
+    // vars = variables required to be filled to create an instance
+    def vars = api.form.get([taskId:handleVacReq.id]).formProperties
+    // variables = the user input for the vars
+    def variables = []
+    // For each required var in vars, ask the user for input and add it to variables
+    vars.each {
+		def line
+		if(it.type == "enum") {
+			def enumIds = it.enumValues.id.join(", ")
+			line = System.console().readLine("> [$it.type] [$enumIds] $it.name: ")
+		}
+		else {
+			line = System.console().readLine("> [$it.type] $it.name: ")
+		}
+		variables.add([name: it.id, value: line])
+	}
+	// Go through the Vacation Request process, complete the handle vacation request task
+	api.task.takeAction(handleVacReq, [action:"complete", variables:variables])
+	// Set the processInstanceService to query the historic datatable.
+	// When a process instance is completed, it is removed from the normal datatable and
+	// added to the historic datatable.
+	api.process.instance.historic = true
+	vacationReq.history = new HistoricProcessInstance(api.process.instance.get(vacationReq.id))
+	// If found in the historic datatable it should be completed, but I checked the end date
+	// as an extra form of validation.
+	assert vacationReq.history.endTime != null
+
+	// Set the processInstanceService back to querying the normal (non-historic) data.
+	api.process.instance.historic = false
+    
+    def instances = api.process.instance.list().collect { new ProcessInstance(it) }
+
+    // Go through the process of claiming, and completing another process
+    def hardTask = new Task(api.task.list([name: "Investigate hardware"])[0])
+    def softTask = new Task(api.task.list([name: "Investigate software"])[0])
+    api.task.takeAction(hardTask, [action:"claim", assignee:Globals.CONF.username2])
+    api.task.takeAction(softTask, [action:"claim", assignee:Globals.CONF.username2])
+    api.task.takeAction(hardTask, [action:"complete"])
+    api.task.takeAction(softTask, [action:"complete"])
+    api.task.list([name: "Write report"]).each { api.task.takeAction(new Task(it), [action:"complete"]) }
+
+    // Tries to delete anything that was created. Basically trying to keep the database clean.
     api.cleanUp()
 }
 
 main()
 
 System.exit(0)
+
+
